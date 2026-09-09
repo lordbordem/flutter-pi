@@ -160,6 +160,12 @@ struct gstplayer {
     sd_event_source *busfd_events;
 
     bool is_live;
+
+    /**
+     * @brief True if the pipeline was built by @ref udp_rtp_pipeline_description for a raw
+     * RTP/H.264 stream on a UDP socket (a `udp://host:port` uri).
+     */
+    bool is_udp_rtp;
 };
 
 #define MAX_N_PLANES 4
@@ -842,6 +848,152 @@ void on_source_setup(GstElement *bin, GstElement *source, gpointer userdata) {
     }
 }
 
+/**
+ * @brief Build an explicit pipeline for a `udp://[host]:port` uri carrying raw RTP/H.264,
+ * which is how the Blindsight streaming service and the site cameras deliver live video.
+ *
+ * uridecodebin cannot play this: raw RTP on a bare UDP socket has nothing to typefind, so
+ * it never negotiates and the player never initializes. The chain mirrors
+ * virtual-blindsight's video_player_elinux CreateUdpPipeline so both embedders behave the
+ * same: udpsrc with the RTP caps declared, an optional reorder buffer (VBS_RTP_JITTER_MS),
+ * depayload, parse, the platform's V4L2 decoder (or libav), the platform's hardware colour
+ * converter (or videoconvert) to RGBA, sized by VBS_VIDEO_TILE=WxH, into an appsink;
+ * VBS_VIDEO_FORMAT=NV12 skips the converter and imports the decoder's NV12 directly.
+ * A multicast host (224.0.0.0/4) is joined, on VBS_MCAST_IFACE when set.
+ *
+ * @returns A malloc'd pipeline description, or NULL if the uri is not a usable udp:// uri.
+ */
+static char *udp_rtp_pipeline_description(const char *uri) {
+    const char *host_begin, *colon, *env, *decoder, *converter;
+    GstElementFactory *factory;
+    char host[64], source_opts[160], jitter[96], tile[48], descr[768];
+    size_t host_len;
+    int port, jitter_ms, tile_w, tile_h, n;
+
+    if (strncmp(uri, "udp://", 6) != 0) {
+        return NULL;
+    }
+
+    host_begin = uri + 6;
+    colon = strrchr(host_begin, ':');
+    if (colon == NULL) {
+        LOG_ERROR("udp:// uri has no port: %s\n", uri);
+        return NULL;
+    }
+    port = atoi(colon + 1);
+    if (port <= 0 || port > 65535) {
+        LOG_ERROR("udp:// uri has no valid port: %s\n", uri);
+        return NULL;
+    }
+    host_len = colon - host_begin;
+    if (host_len >= sizeof(host)) {
+        LOG_ERROR("udp:// uri host too long: %s\n", uri);
+        return NULL;
+    }
+    memcpy(host, host_begin, host_len);
+    host[host_len] = '\0';
+
+    // 0.0.0.0 (or no host) binds any address, the unicast case. A multicast group is joined,
+    // and the kernel needs to know which interface to join it on when there are several.
+    source_opts[0] = '\0';
+    if (host_len > 0 && strcmp(host, "0.0.0.0") != 0) {
+        int first_octet = atoi(host);
+        if (first_octet >= 224 && first_octet <= 239) {
+            env = getenv("VBS_MCAST_IFACE");
+            if (env != NULL && *env != '\0') {
+                snprintf(source_opts, sizeof(source_opts), " address=%s auto-multicast=true multicast-iface=%s", host, env);
+            } else {
+                snprintf(source_opts, sizeof(source_opts), " address=%s auto-multicast=true", host);
+            }
+        } else {
+            snprintf(source_opts, sizeof(source_opts), " address=%s", host);
+        }
+    }
+
+    // Off by default: on a direct link it only adds its configured latency. 100 ms matches
+    // the camera vendor's reference pipeline for switched multicast.
+    jitter[0] = '\0';
+    env = getenv("VBS_RTP_JITTER_MS");
+    jitter_ms = env != NULL ? atoi(env) : 0;
+    if (jitter_ms > 0) {
+        snprintf(jitter, sizeof(jitter), "rtpjitterbuffer latency=%d drop-on-latency=true ! ", jitter_ms);
+    }
+
+    factory = gst_element_factory_find("v4l2h264dec");
+    decoder = factory != NULL ? "v4l2h264dec" : "avdec_h264";
+    if (factory != NULL) {
+        gst_object_unref(factory);
+    }
+
+    // The decoder's native output is NV12. By default it is converted to RGBA (and scaled to
+    // the tile) by the platform's converter; on the i.MX8MM that converter runs on the same
+    // GPU that renders the UI. VBS_VIDEO_FORMAT=NV12 hands the decoder's frames to EGL as
+    // they are instead, so the GPU samples YUV while it draws and does no conversion pass.
+    factory = gst_element_factory_find("imxvideoconvert_g2d");
+    converter = factory != NULL ? "imxvideoconvert_g2d ! " : "videoconvert ! ";
+    if (factory != NULL) {
+        gst_object_unref(factory);
+    }
+
+    // Decode at the size the tile is drawn at; only the hardware converter scales.
+    tile[0] = '\0';
+    env = factory != NULL ? getenv("VBS_VIDEO_TILE") : NULL;
+    if (env != NULL && sscanf(env, "%dx%d", &tile_w, &tile_h) == 2 && tile_w > 0 && tile_h > 0) {
+        snprintf(tile, sizeof(tile), ",width=%d,height=%d", tile_w, tile_h);
+    }
+
+    const char *format = "RGBA";
+    env = getenv("VBS_VIDEO_FORMAT");
+    if (env != NULL && strcmp(env, "NV12") == 0) {
+        format = "NV12";
+        converter = "";
+        tile[0] = '\0';
+    }
+
+    n = snprintf(
+        descr,
+        sizeof(descr),
+        "udpsrc name=udpsrc port=%d%s "
+        "caps=\"application/x-rtp,media=(string)video,encoding-name=(string)H264,payload=(int)96,clock-rate=(int)90000\" ! "
+        "%s"
+        "rtph264depay name=depay ! h264parse ! %s ! %svideo/x-raw,format=%s%s ! appsink name=sink",
+        port,
+        source_opts,
+        jitter,
+        decoder,
+        converter,
+        format,
+        tile
+    );
+    if (n < 0 || (size_t) n >= sizeof(descr)) {
+        LOG_ERROR("udp:// pipeline description too long for %s\n", uri);
+        return NULL;
+    }
+
+    LOG_DEBUG("udp rtp pipeline: %s\n", descr);
+    return strdup(descr);
+}
+
+/**
+ * @brief Drop delta frames until the first keyframe. Joining a live stream mid-GOP queues
+ * undecodable NALs in the V4L2 decoder's input; once the IDR arrives the backlog is decoded
+ * but its depth never drains, leaving a standing latency of a few frames that varies with
+ * the join phase. Gating on the first keyframe starts the decoder with an empty queue.
+ */
+static GstPadProbeReturn on_probe_depay_keyframe_gate(GstPad *pad, GstPadProbeInfo *info, void *userdata) {
+    GstBuffer *buffer;
+
+    (void) pad;
+    (void) userdata;
+
+    buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (buffer != NULL && GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT)) {
+        return GST_PAD_PROBE_DROP;
+    }
+
+    return GST_PAD_PROBE_REMOVE;
+}
+
 static int init(struct gstplayer *player, bool force_sw_decoders) {
     GstStateChangeReturn state_change_return;
     sd_event_source *busfd_event_source;
@@ -855,8 +1007,12 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     static const char *default_pipeline_descr = "uridecodebin name=\"src\" ! video/x-raw ! appsink sync=true name=\"sink\"";
 
     const char *pipeline_descr;
+    char *udp_rtp_descr = NULL;
     if (player->pipeline_description != NULL) {
         pipeline_descr = player->pipeline_description;
+    } else if (player->video_uri != NULL && (udp_rtp_descr = udp_rtp_pipeline_description(player->video_uri)) != NULL) {
+        pipeline_descr = udp_rtp_descr;
+        player->is_udp_rtp = true;
     } else {
         pipeline_descr = default_pipeline_descr;
     }
@@ -864,8 +1020,10 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     pipeline = gst_parse_launch(pipeline_descr, &error);
     if (pipeline == NULL) {
         LOG_ERROR("Could create GStreamer pipeline from description: %s (pipeline: `%s`)\n", error->message, pipeline_descr);
+        free(udp_rtp_descr);
         return error->code;
     }
+    free(udp_rtp_descr);
 
     sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     if (sink == NULL) {
@@ -885,7 +1043,7 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
 
     src = gst_bin_get_by_name(GST_BIN(pipeline), "src");
 
-    if (player->video_uri != NULL) {
+    if (player->video_uri != NULL && !player->is_udp_rtp) {
         if (src != NULL) {
             g_object_set(G_OBJECT(src), "uri", player->video_uri, NULL);
         } else {
@@ -909,12 +1067,33 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
         }
     }
 
-    gst_base_sink_set_max_lateness(GST_BASE_SINK(sink), 20 * GST_MSECOND);
-    gst_base_sink_set_qos_enabled(GST_BASE_SINK(sink), TRUE);
-    gst_base_sink_set_sync(GST_BASE_SINK(sink), TRUE);
-    gst_app_sink_set_max_buffers(GST_APP_SINK(sink), 2);
-    gst_app_sink_set_emit_signals(GST_APP_SINK(sink), TRUE);
-    gst_app_sink_set_drop(GST_APP_SINK(sink), FALSE);
+    if (player->is_udp_rtp) {
+        // Live RTP: never wait for a preroll or a clock. async=FALSE because a live source
+        // delivers no preroll and the pipeline would sit in PAUSED with its socket bound but
+        // unread; sync=FALSE and drop=TRUE because on a safety display the newest frame wins.
+        gst_base_sink_set_sync(GST_BASE_SINK(sink), FALSE);
+        gst_base_sink_set_async_enabled(GST_BASE_SINK(sink), FALSE);
+        gst_app_sink_set_max_buffers(GST_APP_SINK(sink), 1);
+        gst_app_sink_set_emit_signals(GST_APP_SINK(sink), TRUE);
+        gst_app_sink_set_drop(GST_APP_SINK(sink), TRUE);
+
+        GstElement *depay = gst_bin_get_by_name(GST_BIN(pipeline), "depay");
+        if (depay != NULL) {
+            GstPad *depay_pad = gst_element_get_static_pad(depay, "src");
+            if (depay_pad != NULL) {
+                gst_pad_add_probe(depay_pad, GST_PAD_PROBE_TYPE_BUFFER, on_probe_depay_keyframe_gate, player, NULL);
+                gst_object_unref(depay_pad);
+            }
+            gst_object_unref(depay);
+        }
+    } else {
+        gst_base_sink_set_max_lateness(GST_BASE_SINK(sink), 20 * GST_MSECOND);
+        gst_base_sink_set_qos_enabled(GST_BASE_SINK(sink), TRUE);
+        gst_base_sink_set_sync(GST_BASE_SINK(sink), TRUE);
+        gst_app_sink_set_max_buffers(GST_APP_SINK(sink), 2);
+        gst_app_sink_set_emit_signals(GST_APP_SINK(sink), TRUE);
+        gst_app_sink_set_drop(GST_APP_SINK(sink), FALSE);
+    }
 
     // configure our caps
     // we only accept video formats that we can actually upload to EGL
@@ -963,6 +1142,11 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     if (state_change_return == GST_STATE_CHANGE_NO_PREROLL) {
         LOG_DEBUG("Is Live!\n");
         player->is_live = true;
+
+        // A live source produces nothing in PAUSED, and the caps that complete the video
+        // info (and so the Dart side's initialize()) only arrive with the first sample.
+        // Start it now; play() from the Dart side after initialize() is then a no-op.
+        gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PLAYING);
     } else {
         LOG_DEBUG("Not live!\n");
         player->is_live = false;
@@ -1098,6 +1282,7 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->bus = NULL;
     player->busfd_events = NULL;
     player->is_live = false;
+    player->is_udp_rtp = false;
     return player;
 
     //fail_deinit_error_notifier:
