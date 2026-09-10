@@ -9,6 +9,7 @@
  */
 
 #include "egl_gbm_render_surface.h"
+#include "g2d_rotator.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -58,6 +59,14 @@ struct egl_gbm_render_surface {
     // more than 4 here either.
     struct locked_fb locked_fbs[4];
     struct locked_fb *locked_front_fb;
+
+    // Optional: rotate on the 2D core at present time instead of in the scene.
+    struct g2d_rotator *rotator;
+    // The frame whose rotate-blit is in flight. It is scanned out at the next
+    // present, by which time the 2D core is long done; its render buffer stays
+    // locked until then.
+    struct g2d_rotator_fb *pending_fb;
+    struct locked_fb *pending_src;
 #ifdef DEBUG
     atomic_int n_locked_fbs;
     bool logged_format_and_modifier;
@@ -244,6 +253,9 @@ static int egl_gbm_render_surface_init(
         s->locked_fbs[i].is_locked = (atomic_flag) ATOMIC_FLAG_INIT;
     }
     s->locked_front_fb = NULL;
+    s->rotator = NULL;
+    s->pending_fb = NULL;
+    s->pending_src = NULL;
 #ifdef DEBUG
     s->n_locked_fbs = 0;
     s->logged_format_and_modifier = false;
@@ -339,6 +351,14 @@ void egl_gbm_render_surface_deinit(struct surface *s) {
 
     egl_surface = CAST_EGL_GBM_RENDER_SURFACE(s);
 
+    if (egl_surface->pending_fb != NULL) {
+        g2d_rotator_fb_wait(egl_surface->pending_fb);
+        g2d_rotator_fb_release(egl_surface->pending_fb);
+        locked_fb_unref(egl_surface->pending_src);
+        egl_surface->pending_fb = NULL;
+        egl_surface->pending_src = NULL;
+    }
+
     gl_renderer_unref(egl_surface->renderer);
     render_surface_deinit(s);
 }
@@ -380,6 +400,105 @@ static void on_release_layer(void *userdata) {
     locked_fb_unref(fb);
 }
 
+static void on_release_rotated_layer(void *userdata) {
+    ASSERT_NOT_NULL(userdata);
+    g2d_rotator_fb_release(userdata);
+}
+
+void egl_gbm_render_surface_set_rotator(struct egl_gbm_render_surface *s, struct g2d_rotator *rotator) {
+    surface_lock(CAST_SURFACE(s));
+    s->rotator = rotator;
+    surface_unlock(CAST_SURFACE(s));
+}
+
+static int push_rotated_layer(struct egl_gbm_render_surface *egl_surface, struct kms_req_builder *builder, struct g2d_rotator_fb *fb) {
+    int display_w, display_h, ok;
+
+    g2d_rotator_get_size(egl_surface->rotator, &display_w, &display_h);
+
+    ok = kms_req_builder_push_fb_layer(
+        builder,
+        &(const struct kms_fb_layer){
+            .drm_fb_id = g2d_rotator_fb_get_drm_fb_id(fb),
+            .format = g2d_rotator_get_format(egl_surface->rotator),
+            .has_modifier = g2d_rotator_fb_get_modifier(fb) != DRM_FORMAT_MOD_INVALID,
+            .modifier = g2d_rotator_fb_get_modifier(fb),
+
+            .dst_x = 0,
+            .dst_y = 0,
+            .dst_w = (uint32_t) display_w,
+            .dst_h = (uint32_t) display_h,
+
+            .src_x = 0,
+            .src_y = 0,
+            .src_w = DOUBLE_TO_FP1616_ROUNDED(display_w),
+            .src_h = DOUBLE_TO_FP1616_ROUNDED(display_h),
+
+            .has_rotation = true,
+            .rotation = PLANE_TRANSFORM_ROTATE_0,
+            .enforce_rotation = false,
+
+            .has_in_fence_fd = false,
+            .in_fence_fd = 0,
+        },
+        on_release_rotated_layer,
+        NULL,
+        fb,
+        NULL
+    );
+    if (ok != 0) {
+        g2d_rotator_fb_release(fb);
+    }
+    return ok;
+}
+
+// The scene was rendered upright at view size. Queue its rotation on the 2D
+// core, and scan out the PREVIOUS frame's rotation, which finished while this
+// frame was being rendered: the blit (~3 ms) then never sits inside the frame
+// budget. Costs one frame of latency; the first frame is presented directly.
+static int present_rotated_kms(struct egl_gbm_render_surface *egl_surface, struct kms_req_builder *builder) {
+    struct g2d_rotator_fb *fb;
+    int ok;
+
+    ok = g2d_rotator_blit_async(egl_surface->rotator, egl_surface->locked_front_fb->bo, &fb);
+    if (ok != 0) {
+        return ok;
+    }
+
+    if (egl_surface->pending_fb == NULL) {
+        // First frame: nothing to show yet, present this one synchronously.
+        g2d_rotator_fb_wait(fb);
+        ok = push_rotated_layer(egl_surface, builder, fb);
+        if (ok != 0) {
+            return ok;
+        }
+        // Keep this frame's blit accounted as the pipeline's head, but the
+        // buffer was already handed to KMS: mark it not pending.
+        egl_surface->pending_fb = NULL;
+        egl_surface->pending_src = NULL;
+        // Re-queue: the next present needs a pending frame to show. Blit it again
+        // into a second buffer so the pipeline starts without a double push.
+        ok = g2d_rotator_blit_async(egl_surface->rotator, egl_surface->locked_front_fb->bo, &fb);
+        if (ok != 0) {
+            return ok;
+        }
+    } else {
+        g2d_rotator_fb_wait(egl_surface->pending_fb);
+        ok = push_rotated_layer(egl_surface, builder, egl_surface->pending_fb);
+        locked_fb_unref(egl_surface->pending_src);
+        egl_surface->pending_fb = NULL;
+        egl_surface->pending_src = NULL;
+        if (ok != 0) {
+            g2d_rotator_fb_release(fb);
+            return ok;
+        }
+    }
+
+    egl_surface->pending_fb = fb;
+    egl_surface->pending_src = locked_fb_ref(egl_surface->locked_front_fb);
+    return 0;
+}
+
 static int egl_gbm_render_surface_present_kms(struct surface *s, const struct fl_layer_props *props, struct kms_req_builder *builder) {
     struct egl_gbm_render_surface *egl_surface;
     struct gbm_bo_meta *meta;
@@ -400,6 +519,12 @@ static int egl_gbm_render_surface_present_kms(struct surface *s, const struct fl
         egl_surface->locked_front_fb,
         "There's no framebuffer available for scanout right now. Make sure you called render_surface_queue_present() before presenting."
     );
+
+    if (egl_surface->rotator != NULL) {
+        ok = present_rotated_kms(egl_surface, builder);
+        surface_unlock(s);
+        return ok;
+    }
 
     bo = egl_surface->locked_front_fb->bo;
     meta = gbm_bo_get_user_data(bo);

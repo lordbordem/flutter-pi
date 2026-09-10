@@ -45,6 +45,15 @@ struct egl_gbm_render_surface *egl_gbm_render_surface_new(
     enum pixfmt pixel_format
 );
 
+struct g2d_rotator;
+
+/**
+ * @brief Present through @p rotator: frames rendered upright into this surface
+ * are rotate-blitted on the 2D core into its scanout buffers, and those are
+ * what reach KMS. The surface does not own the rotator.
+ */
+void egl_gbm_render_surface_set_rotator(struct egl_gbm_render_surface *s, struct g2d_rotator *rotator);
+
 ATTR_PURE EGLSurface egl_gbm_render_surface_get_egl_surface(struct egl_gbm_render_surface *s);
 
 ATTR_PURE EGLConfig egl_gbm_render_surface_get_egl_config(struct egl_gbm_render_surface *s);

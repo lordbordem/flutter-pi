@@ -12,6 +12,7 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <pthread.h>
 
@@ -23,6 +24,7 @@
 #include "frame_scheduler.h"
 #include "modesetting.h"
 #include "render_surface.h"
+#include "g2d_rotator.h"
 #include "surface.h"
 #include "tracer.h"
 #include "util/collection.h"
@@ -201,6 +203,17 @@ struct window {
      *
      */
     struct render_surface *render_surface;
+
+    /**
+     * @brief Rotate on the 2D core at present time (see g2d_rotator.h) instead
+     * of handing the rotation to the engine as a scene transform, which on a
+     * weak 3D GPU multiplies the raster cost of a complex scene. When set, the
+     * engine renders upright at view size, `view_to_display_transform` reported
+     * to it is the identity, and the KMS window rotate-blits each frame. Input
+     * keeps the real display-to-view transform.
+     */
+    bool rotate_on_2d_core;
+    struct g2d_rotator *rotator;
 
 #ifdef HAVE_EGL_GLES2
     /**
@@ -408,6 +421,8 @@ static int window_init(
     window->gl_renderer = NULL;
     window->vk_renderer = NULL;
     window->render_surface = NULL;
+    window->rotate_on_2d_core = false;
+    window->rotator = NULL;
     window->cursor_enabled = false;
     window->cursor_pos = VEC2I(0, 0);
     window->push_composition = NULL;
@@ -458,6 +473,11 @@ struct view_geometry window_get_view_geometry(struct window *window) {
         .view_to_display_transform = window->view_to_display_transform,
         .device_pixel_ratio = window->pixel_ratio,
     };
+
+    if (window->rotate_on_2d_core) {
+        // The engine renders upright; the rotation happens after rendering.
+        geometry.view_to_display_transform = MAT3F_TRANSLATION(0, 0);
+    }
     window_unlock(window);
 
     return geometry;
@@ -1017,6 +1037,32 @@ MUST_CHECK struct window *kms_window_new(
     } else {
         window->vk_renderer = NULL;
     }
+    // Rotation on the 2D core: opt-out with FLUTTERPI_ROTATE_2D=0. Decided here,
+    // before the first render surface exists, because it changes the size the
+    // engine is asked to render at.
+    if (!window->rotation.rotate_0 && renderer_type == kOpenGL_RendererType) {
+        const char *env = getenv("FLUTTERPI_ROTATE_2D");
+        if (env == NULL || strcmp(env, "0") != 0) {
+            enum pixfmt format = has_forced_pixel_format ? forced_pixel_format : PIXFMT_ARGB8888;
+#ifdef HAVE_EGL_GLES2
+            window->rotator = g2d_rotator_new(
+                gl_renderer_get_gbm_device(gl_renderer),
+                drmdev,
+                selected_mode->hdisplay,
+                selected_mode->vdisplay,
+                window->rotation,
+                format
+            );
+#endif
+            if (window->rotator != NULL) {
+                window->rotate_on_2d_core = true;
+                LOG_ERROR("Rotating on the 2D core: the scene renders upright at %dx%d.\n", (int) window->view_size.x, (int) window->view_size.y);
+            } else {
+                LOG_ERROR("2D-core rotation unavailable, the engine will rotate the scene.\n");
+            }
+        }
+    }
+
     window->push_composition = kms_window_push_composition;
     window->get_render_surface = kms_window_get_render_surface;
 #ifdef HAVE_EGL_GLES2
@@ -1062,6 +1108,11 @@ void kms_window_deinit(struct window *window) {
     }
     if (window->render_surface != NULL) {
         surface_unref(CAST_SURFACE(window->render_surface));
+    }
+    if (window->rotator != NULL) {
+        // After the render surface: it only borrows the rotator.
+        g2d_rotator_destroy(window->rotator);
+        window->rotator = NULL;
     }
     if (window->gl_renderer != NULL) {
 #ifdef HAVE_EGL_GLES2
@@ -1377,7 +1428,11 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
         // Flutter wants a render surface, but hasn't told us the backing store dimensions yet.
         // Just make a good guess about the dimensions.
         LOG_DEBUG("Flutter requested render surface before supplying surface dimensions.\n");
-        size = VEC2I(window->kms.mode->hdisplay, window->kms.mode->vdisplay);
+        if (window->rotate_on_2d_core) {
+            size = vec2f_round_to_integer(window->view_size);
+        } else {
+            size = VEC2I(window->kms.mode->hdisplay, window->kms.mode->vdisplay);
+        }
     }
 
     enum pixfmt pixel_format;
@@ -1470,6 +1525,9 @@ static struct render_surface *kms_window_get_render_surface_internal(struct wind
             LOG_ERROR("Couldn't create EGL GBM rendering surface.\n");
             render_surface = NULL;
         } else {
+            if (window->rotator != NULL) {
+                egl_gbm_render_surface_set_rotator(egl_surface, window->rotator);
+            }
             render_surface = CAST_RENDER_SURFACE(egl_surface);
         }
 
