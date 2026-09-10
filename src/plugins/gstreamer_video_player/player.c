@@ -866,7 +866,7 @@ void on_source_setup(GstElement *bin, GstElement *source, gpointer userdata) {
 static char *udp_rtp_pipeline_description(const char *uri) {
     const char *host_begin, *colon, *env, *decoder, *converter;
     GstElementFactory *factory;
-    char host[64], source_opts[160], jitter[96], tile[48], descr[768];
+    char host[64], source_opts[160], jitter[96], tile[48], descr[896];
     size_t host_len;
     int port, jitter_ms, tile_w, tile_h, n;
 
@@ -942,6 +942,25 @@ static char *udp_rtp_pipeline_description(const char *uri) {
         snprintf(tile, sizeof(tile), ",width=%d,height=%d", tile_w, tile_h);
     }
 
+    // Bench aid: VBS_VIDEO_CROP=left,right,top,bottom crops the decoded frame (pixels) before the
+    // converter scales it to the tile, so a small region of the camera image fills the tile.
+    // Costs one small NV12 copy per frame (the g2d converter carries no crop meta).
+    char crop[96];
+    int crop_l, crop_r, crop_t, crop_b;
+    crop[0] = '\0';
+    env = getenv("VBS_VIDEO_CROP");
+    if (env != NULL && sscanf(env, "%d,%d,%d,%d", &crop_l, &crop_r, &crop_t, &crop_b) == 4) {
+        snprintf(crop, sizeof(crop), "videocrop left=%d right=%d top=%d bottom=%d ! ", crop_l, crop_r, crop_t, crop_b);
+    }
+
+    // Bench aid: VBS_VIDEO_SW=1 converts and scales on the CPU instead of the g2d. Needed with
+    // VBS_VIDEO_CROP: the g2d converter accepts videocrop's in-place crop meta but its output
+    // pool then starves after a few frames and the pipeline stalls.
+    env = getenv("VBS_VIDEO_SW");
+    if (env != NULL && *env == '1') {
+        converter = "videoconvert ! videoscale ! ";
+    }
+
     const char *format = "RGBA";
     env = getenv("VBS_VIDEO_FORMAT");
     if (env != NULL && strcmp(env, "NV12") == 0) {
@@ -956,11 +975,12 @@ static char *udp_rtp_pipeline_description(const char *uri) {
         "udpsrc name=udpsrc port=%d%s "
         "caps=\"application/x-rtp,media=(string)video,encoding-name=(string)H264,payload=(int)96,clock-rate=(int)90000\" ! "
         "%s"
-        "rtph264depay name=depay ! h264parse ! %s ! %svideo/x-raw,format=%s%s ! appsink name=sink",
+        "rtph264depay name=depay ! h264parse ! %s ! %s%svideo/x-raw,format=%s%s ! appsink name=sink",
         port,
         source_opts,
         jitter,
         decoder,
+        crop,
         converter,
         format,
         tile
@@ -1139,7 +1159,10 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
 
     LOG_DEBUG("Setting state to paused...\n");
     state_change_return = gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PAUSED);
-    if (state_change_return == GST_STATE_CHANGE_NO_PREROLL) {
+    // A udp:// RTP pipeline is live by construction; with extra transform elements in the
+    // chain the bin's aggregated state-change result can read ASYNC instead of NO_PREROLL,
+    // which would leave the pipeline prerolled in PAUSED forever.
+    if (state_change_return == GST_STATE_CHANGE_NO_PREROLL || player->is_udp_rtp) {
         LOG_DEBUG("Is Live!\n");
         player->is_live = true;
 
